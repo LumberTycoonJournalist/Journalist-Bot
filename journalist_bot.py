@@ -481,6 +481,102 @@ async def job_close(interaction: discord.Interaction, job_id: int):
     if log_ch:
         await log_ch.send(f"🔒 Job #{job_id} closed by {interaction.user.mention}.")
 
+@bot.tree.command(description="Re-open a closed job (Admin)")
+@app_commands.default_permissions(manage_guild=True)
+async def job_open(interaction: discord.Interaction, job_id: int):
+    async with bot.db.execute(
+        "SELECT status FROM jobs WHERE id=? AND guild_id=?",
+        (job_id, interaction.guild.id)
+    ) as cur:
+        row = await cur.fetchone()
+
+    if not row:
+        return await interaction.response.send_message("Job not found.", ephemeral=True)
+    if row[0] != "closed":
+        return await interaction.response.send_message("Only closed jobs can be reopened.", ephemeral=True)
+
+    await bot.db.execute("UPDATE jobs SET status='open', claimed_by=NULL WHERE id=?", (job_id,))
+    await bot.db.commit()
+    await interaction.response.send_message(f"🔓 Job #{job_id} reopened.")
+
+    log_ch = await get_log_channel(interaction.guild)
+    if log_ch:
+        await log_ch.send(f"🔓 Job #{job_id} reopened by {interaction.user.mention}.")
+@bot.tree.command(description="Quick-create a job (no modal)")
+@app_commands.describe(
+    title="Job title",
+    category="Optional category (affects open-to-all)",
+    description="Optional description"
+)
+@app_commands.default_permissions(manage_guild=True)
+async def job_post(
+    interaction: discord.Interaction,
+    title: str,
+    category: Optional[str] = None,
+    description: Optional[str] = None
+):
+    await ensure_seed_for_guild(interaction.guild.id)
+    open_to_all = 1 if await compute_open_to_all(interaction.guild.id, category) else 0
+
+    await bot.db.execute(
+        "INSERT INTO jobs(guild_id, title, description, category, open_to_all, created_at) VALUES(?, ?, ?, ?, ?, ?)",
+        (interaction.guild.id, title, description or "", category, open_to_all, dt.datetime.utcnow().isoformat())
+    )
+    await bot.db.commit()
+    async with bot.db.execute("SELECT last_insert_rowid()") as cur:
+        job_id = (await cur.fetchone())[0]
+
+    view = JobBoardView(job_id)
+    badge = "🌐 Open to all" if open_to_all else "🔒 Role-gated"
+    cat_txt = f"\n**Category:** {category}" if category else ""
+    embed = discord.Embed(
+        title=f"Job #{job_id}: {title}",
+        description=(description or "No description") + cat_txt,
+        color=discord.Color.green()
+    )
+    embed.set_footer(text=badge)
+    await interaction.response.send_message(embed=embed, view=view)
+
+    log_ch = await get_log_channel(interaction.guild)
+    if log_ch:
+        await log_ch.send(f"🆕 Job #{job_id} created by {interaction.user.mention}: **{title}** ({badge})")
+@bot.tree.command(description="Delete a job (Admin)")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(
+    job_id="The numeric ID shown in /job_list",
+    reason="Optional reason to include in logs"
+)
+async def job_delete(interaction: discord.Interaction, job_id: int, reason: Optional[str] = None):
+    # Fetch job details first (for a nice log message)
+    async with bot.db.execute(
+        "SELECT title, status, claimed_by, category FROM jobs WHERE id=? AND guild_id=?",
+        (job_id, interaction.guild.id)
+    ) as cur:
+        row = await cur.fetchone()
+
+    if not row:
+        return await interaction.response.send_message("Job not found.", ephemeral=True)
+
+    title, status, claimed_by, category = row
+
+    # Delete the job
+    await bot.db.execute("DELETE FROM jobs WHERE id=? AND guild_id=?", (job_id, interaction.guild.id))
+    await bot.db.commit()
+
+    # Tell the channel and log it
+    await interaction.response.send_message(f"🗑️ Deleted job `#{job_id}`: **{title}**.")
+    log_ch = await get_log_channel(interaction.guild)
+    if log_ch:
+        details = [f"status={status}"]
+        if claimed_by:
+            details.append(f"claimed_by=<@{claimed_by}>")
+        if category:
+            details.append(f"category={category}")
+        details_str = ", ".join(details)
+        rsn = f" Reason: {reason}" if reason else ""
+        await log_ch.send(f"🗑️ Job `#{job_id}` (**{title}**) deleted by {interaction.user.mention}. {details_str}.{rsn}")
+
+
 # ---------------------- warnings ----------------------
 warns = app_commands.Group(name="warn", description="Manage warnings")
 bot.tree.add_command(warns)
