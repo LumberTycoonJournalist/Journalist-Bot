@@ -48,10 +48,10 @@ class JournalBot(commands.Bot):
             application_id=None
         )
         self.db: Optional[aiosqlite.Connection] = None
-        self.tree = app_commands.CommandTree(self)
-        # background loops
+        # use the built-in self.tree from commands.Bot
         self.ping_every_two_days_loop.change_interval(hours=48)
-        self.rotate_weekly_loop.change_interval(hours=168)  # 7 days
+        self.rotate_weekly_loop.change_interval(hours=168)
+
 
     async def setup_hook(self):
         self.db = await aiosqlite.connect(DB_PATH)
