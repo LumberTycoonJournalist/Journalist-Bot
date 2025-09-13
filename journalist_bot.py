@@ -17,6 +17,9 @@ from discord import app_commands
 from discord.ext import commands, tasks
 import aiosqlite
 from dotenv import load_dotenv
+import logging
+logging.basicConfig(level=logging.INFO)   # show discord.py INFO logs
+
 
 DB_PATH = "journalist_bot.db"
 
@@ -201,6 +204,13 @@ class JournalBot(commands.Bot):
         await self.db.commit()
 
 bot = JournalBot()
+@bot.event
+async def on_connect():
+    print("[bot] Connected to Discord gateway")
+
+@bot.event
+async def on_ready():
+    print(f"[bot] Logged in as {bot.user} (ID: {bot.user.id})")
 
 # ---------------------- helpers ----------------------
 async def normalize(s: str) -> str:
@@ -527,14 +537,28 @@ async def warn_list(interaction: discord.Interaction, user: discord.Member):
     await interaction.response.send_message(embed=embed)
 
 # ---------------------- startup (KEEP THIS AT THE BOTTOM) ----------------------
+from pathlib import Path
+
 async def main():
-    load_dotenv()
+    env_path = Path(__file__).parent / ".env"
+    load_dotenv(dotenv_path=env_path)
+
     token = os.getenv("DISCORD_TOKEN")
+    print("[startup] cwd:", os.getcwd())
+    print("[startup] .env exists:", env_path.exists())
+    print("[startup] token loaded:", bool(token))
+
     if not token:
         print("Please set DISCORD_TOKEN in .env")
         return
-    async with bot:
-        await bot.start(token)
+
+    try:
+        async with bot:
+            await bot.start(token)
+    except discord.LoginFailure as e:
+        print("[startup] Login failed (bad token?):", e)
+    except Exception as e:
+        print("[startup] Unexpected error starting bot:", repr(e))
 
 if __name__ == "__main__":
     try:
