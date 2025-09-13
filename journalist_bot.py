@@ -151,7 +151,7 @@ class JournalBot(commands.Bot):
     async def _before_ping(self):
         await self.wait_until_ready()
 
-    @tasks.loop(weeks=1)
+    @tasks.loop(hours=168)  # 7 days
     async def rotate_weekly_loop(self):
         try:
             general_id = await self.get_setting("general_channel_id")
