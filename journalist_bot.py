@@ -7,7 +7,7 @@
 # - Weekly interview rotation + 2-day reminders
 # - Logs to a configured channel
 # - Manager+ access layer for sensitive commands (role or per-user)
-# - Per-guild command sync and /sync
+# - Per-guild command sync (copy globals to guild) and /sync
 # - Job Board: single message with Prev/Refresh/Next and jump links; slash claim/unclaim
 # - SQLite persistence
 
@@ -68,21 +68,22 @@ class JournalBot(commands.Bot):
         self.db = await aiosqlite.connect(DB_PATH)
         await self._init_db()
 
-        # Attach persistent views (so board buttons keep working after restarts)
+        # Attach persistent views (board buttons persist across restarts)
         try:
-            self.add_view(BoardView())  # persistent because timeout=None inside the class
+            self.add_view(BoardView())  # persistent, timeout=None in class
         except Exception as e:
             print("[setup] add_view error:", e)
 
-        # Fast per-guild sync (instant command availability)
+        # FAST availability: copy global commands to each guild, then sync
         for g in self.guilds:
             try:
+                self.tree.copy_global_to(guild=g)
                 await self.tree.sync(guild=g)
-                print(f"[sync] Commands synced to guild {g.id} ({g.name})")
+                print(f"[sync] Commands copied+synced to guild {g.id} ({g.name})")
             except Exception as e:
                 print(f"[sync] Guild sync error for {g.id}: {e}")
 
-        # Optional: global sync as fallback
+        # Optional: also keep a global sync (fallback)
         try:
             await self.tree.sync()
             print("[sync] Global sync done")
@@ -489,8 +490,12 @@ async def admin_list(interaction: discord.Interaction):
     await interaction.response.send_message("Managers: " + ", ".join(mentions), ephemeral=True)
 
 @bot.tree.command(description="Force re-sync application commands to this server (Admin)")
-@app_commands.default_permissions(administrator=True)
+@app_commands.default_permissions(manage_guild=True)
 async def sync(interaction: discord.Interaction):
+    # runtime guard in case default perms are overridden in Integrations
+    if not interaction.user.guild_permissions.manage_guild:
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
+    bot.tree.copy_global_to(guild=interaction.guild)
     await bot.tree.sync(guild=interaction.guild)
     await interaction.response.send_message("✅ Commands synced to this server.", ephemeral=True)
 
@@ -860,7 +865,6 @@ async def job_delete(interaction: discord.Interaction, job_id: int, reason: Opti
                 await msg.delete()
                 deleted_msg = True
             except Exception as e:
-                # Could be missing perms or message already gone
                 print(f"[job_delete] Could not delete message #{msg_id} in #{ch_id}: {e}")
 
     # Remove the job from DB
