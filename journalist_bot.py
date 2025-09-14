@@ -8,11 +8,13 @@
 # - Logs to a configured channel
 # - Manager+ access layer for sensitive commands (role or per-user)
 # - Per-guild command sync and /sync
+# - Job Board: single message with Prev/Refresh/Next and jump links; slash claim/unclaim
 # - SQLite persistence
 
 import os
 import asyncio
 import datetime as dt
+from math import ceil
 from typing import Optional, List
 
 import logging
@@ -45,6 +47,7 @@ OPEN_TO_ALL_SEED = {
     "wiki fact",
 }
 
+# ---------------------- Bot ----------------------
 class JournalBot(commands.Bot):
     def __init__(self):
         super().__init__(
@@ -64,6 +67,12 @@ class JournalBot(commands.Bot):
         # Open DB and init tables
         self.db = await aiosqlite.connect(DB_PATH)
         await self._init_db()
+
+        # Attach persistent views (so board buttons keep working after restarts)
+        try:
+            self.add_view(BoardView())  # persistent because timeout=None inside the class
+        except Exception as e:
+            print("[setup] add_view error:", e)
 
         # Fast per-guild sync (instant command availability)
         for g in self.guilds:
@@ -144,22 +153,16 @@ class JournalBot(commands.Bot):
             """
         )
         # Best-effort migrations for older DBs
-        try:
-            await self.db.execute("ALTER TABLE jobs ADD COLUMN category TEXT")
-        except Exception:
-            pass
-        try:
-            await self.db.execute("ALTER TABLE jobs ADD COLUMN open_to_all INTEGER NOT NULL DEFAULT 0")
-        except Exception:
-            pass
-        try:
-            await self.db.execute("ALTER TABLE jobs ADD COLUMN message_channel_id INTEGER")
-        except Exception:
-            pass
-        try:
-            await self.db.execute("ALTER TABLE jobs ADD COLUMN message_id INTEGER")
-        except Exception:
-            pass
+        for stmt in [
+            "ALTER TABLE jobs ADD COLUMN category TEXT",
+            "ALTER TABLE jobs ADD COLUMN open_to_all INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE jobs ADD COLUMN message_channel_id INTEGER",
+            "ALTER TABLE jobs ADD COLUMN message_id INTEGER",
+        ]:
+            try:
+                await self.db.execute(stmt)
+            except Exception:
+                pass
 
         await self.db.commit()
 
@@ -322,6 +325,91 @@ async def is_manager_or_admin(interaction: discord.Interaction) -> bool:
     ) as cur:
         return (await cur.fetchone()) is not None
 
+# -------- Job Board utilities --------
+async def render_board_embed(guild: discord.Guild, page: int, per_page: int = 8) -> tuple[discord.Embed, int, int]:
+    # Count open jobs
+    async with bot.db.execute(
+        "SELECT COUNT(*) FROM jobs WHERE guild_id=? AND status='open'",
+        (guild.id,)
+    ) as cur:
+        total_open = (await cur.fetchone())[0]
+
+    total_pages = max(1, ceil(total_open / per_page)) if total_open else 1
+    page = max(1, min(page, total_pages))
+    offset = (page - 1) * per_page
+
+    async with bot.db.execute(
+        "SELECT id, title, category, open_to_all, claimed_by, message_channel_id, message_id "
+        "FROM jobs WHERE guild_id=? AND status='open' "
+        "ORDER BY id DESC LIMIT ? OFFSET ?",
+        (guild.id, per_page, offset)
+    ) as cur:
+        rows = await cur.fetchall()
+
+    if not rows:
+        desc = "No open jobs. 🎉"
+    else:
+        lines = []
+        for jid, title, category, open_to_all, claimed_by, ch_id, msg_id in rows:
+            badge = "🌐" if open_to_all else "🔒"
+            cat_txt = f" [{category}]" if category else ""
+            link = ""
+            if ch_id and msg_id:
+                link_url = f"https://discord.com/channels/{guild.id}/{ch_id}/{msg_id}"
+                link = f" — [jump]({link_url})"
+            lines.append(f"`#{jid}` {badge} **{title}**{cat_txt}{link}")
+        desc = "\n".join(lines)
+
+    embed = discord.Embed(
+        title="🗂️ Job Board — Open Jobs",
+        description=desc,
+        color=discord.Color.blurple()
+    )
+    embed.set_footer(text=f"Page {page}/{total_pages} • {total_open} open job(s)")
+    return embed, total_pages, total_open
+
+async def update_job_board(new_page: Optional[int] = None, bump: int = 0):
+    ch_id = await bot.get_setting("job_board_channel_id")
+    msg_id = await bot.get_setting("job_board_message_id")
+    if not (ch_id and msg_id):
+        return
+    channel = bot.get_channel(int(ch_id))
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        return
+    guild = channel.guild
+    page = int((await bot.get_setting("job_board_page", "1")) or "1")
+    if new_page is not None:
+        page = new_page
+    page += bump
+
+    embed, total_pages, _ = await render_board_embed(guild, page)
+    page = max(1, min(page, total_pages))
+    await bot.set_setting("job_board_page", str(page))
+    try:
+        msg = await channel.fetch_message(int(msg_id))
+        await msg.edit(embed=embed, view=BoardView())
+    except Exception as e:
+        print("[job_board] update failed:", e)
+
+class BoardView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Prev", style=discord.ButtonStyle.secondary, custom_id="board_prev")
+    async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore
+        await interaction.response.defer(ephemeral=True)
+        await update_job_board(bump=-1)
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, custom_id="board_refresh")
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore
+        await interaction.response.defer(ephemeral=True)
+        await update_job_board()
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, custom_id="board_next")
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore
+        await interaction.response.defer(ephemeral=True)
+        await update_job_board(bump=+1)
+
 # ---------------------- setup/admin commands ----------------------
 @bot.tree.command(description="Configure help (overview)")
 @app_commands.default_permissions(manage_guild=True)
@@ -337,7 +425,9 @@ async def setup(interaction: discord.Interaction):
     embed.add_field(name="/job_add", value="Create a job (with Category) + claim buttons", inline=False)
     embed.add_field(name="/job_post", value="Quick-create a job without a modal", inline=False)
     embed.add_field(name="/job_open /job_close /job_delete", value="Manage jobs", inline=False)
+    embed.add_field(name="/job_claim /job_unclaim", value="Claim or unclaim by ID", inline=False)
     embed.add_field(name="/openall add/remove/list", value="Manage categories anyone can claim", inline=False)
+    embed.add_field(name="/board set/init/refresh", value="Create & control the Job Board", inline=False)
     embed.add_field(name="/sync", value="Force command re-sync (Admin)", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -403,6 +493,55 @@ async def admin_list(interaction: discord.Interaction):
 async def sync(interaction: discord.Interaction):
     await bot.tree.sync(guild=interaction.guild)
     await interaction.response.send_message("✅ Commands synced to this server.", ephemeral=True)
+
+# ---------------------- Job Board commands ----------------------
+board = app_commands.Group(name="board", description="Manage the Job Board")
+bot.tree.add_command(board)
+
+@board.command(name="set", description="Set the channel for the Job Board (Admin)")
+@app_commands.default_permissions(manage_guild=True)
+async def board_set(interaction: discord.Interaction, channel: discord.TextChannel):
+    await bot.set_setting("job_board_channel_id", str(channel.id))
+    await interaction.response.send_message(f"Job Board channel set to {channel.mention}", ephemeral=True)
+
+@board.command(name="init", description="Create/replace the Job Board message (Admin)")
+@app_commands.describe(channel="Channel to post the board (defaults to current)", pin="Pin the board message")
+@app_commands.default_permissions(manage_guild=True)
+async def board_init(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None, pin: Optional[bool] = True):
+    ch = channel or interaction.channel
+    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        return await interaction.response.send_message("Please choose a text channel.", ephemeral=True)
+
+    # If an old board exists, try deleting it to avoid duplicates
+    old_ch_id = await bot.get_setting("job_board_channel_id")
+    old_msg_id = await bot.get_setting("job_board_message_id")
+    if old_ch_id and old_msg_id:
+        old_ch = bot.get_channel(int(old_ch_id))
+        if isinstance(old_ch, (discord.TextChannel, discord.Thread)):
+            try:
+                old_msg = await old_ch.fetch_message(int(old_msg_id))
+                await old_msg.delete()
+            except Exception:
+                pass
+
+    await bot.set_setting("job_board_channel_id", str(ch.id))
+    await bot.set_setting("job_board_page", "1")
+
+    embed, _, _ = await render_board_embed(ch.guild, page=1)
+    msg = await ch.send(embed=embed, view=BoardView())
+    if pin and isinstance(ch, discord.TextChannel):
+        try:
+            await msg.pin()
+        except Exception:
+            pass
+
+    await bot.set_setting("job_board_message_id", str(msg.id))
+    await interaction.response.send_message(f"Job Board created in {ch.mention}.", ephemeral=True)
+
+@board.command(name="refresh", description="Refresh the Job Board")
+async def board_refresh(interaction: discord.Interaction):
+    await update_job_board()
+    await interaction.response.send_message("🔄 Board refreshed.", ephemeral=True)
 
 # ---------------------- rotation ----------------------
 rotation = app_commands.Group(name="rotation", description="Manage weekly interview rotation")
@@ -490,7 +629,7 @@ class JobBoardView(discord.ui.View):
         super().__init__(timeout=None)
         self.job_id = job_id
 
-    @discord.ui.button(label="Claim", style=discord.ButtonStyle.success, custom_id="job_claim")
+    @discord.ui.button(label="Claim", style=discord.ButtonStyle.success, custom_id="job_claim_btn")
     async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore
         async with bot.db.execute("SELECT status, claimed_by, open_to_all FROM jobs WHERE id=?", (self.job_id,)) as cur:
             row = await cur.fetchone()
@@ -510,8 +649,9 @@ class JobBoardView(discord.ui.View):
         log_ch = await get_log_channel(interaction.guild)
         if log_ch:
             await log_ch.send(f"📝 Job #{self.job_id} claimed by {interaction.user.mention}.")
+        await update_job_board()  # refresh board
 
-    @discord.ui.button(label="Unclaim", style=discord.ButtonStyle.secondary, custom_id="job_unclaim")
+    @discord.ui.button(label="Unclaim", style=discord.ButtonStyle.secondary, custom_id="job_unclaim_btn")
     async def unclaim(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore
         async with bot.db.execute("SELECT status, claimed_by FROM jobs WHERE id=?", (self.job_id,)) as cur:
             row = await cur.fetchone()
@@ -533,6 +673,7 @@ class JobBoardView(discord.ui.View):
         log_ch = await get_log_channel(interaction.guild)
         if log_ch:
             await log_ch.send(f"📤 Job #{self.job_id} unclaimed by {interaction.user.mention}.")
+        await update_job_board()  # refresh board
 
 class JobModal(discord.ui.Modal, title="Create a Job"):
     title_input = discord.ui.TextInput(label="Title", placeholder="e.g., Write feature on local event", max_length=100)
@@ -574,6 +715,7 @@ class JobModal(discord.ui.Modal, title="Create a Job"):
         log_ch = await get_log_channel(interaction.guild)
         if log_ch:
             await log_ch.send(f"🆕 Job #{job_id} created by {interaction.user.mention}: **{self.title_input}** ({badge})")
+        await update_job_board()
 
 @bot.tree.command(description="Create a job with interactive claim/unclaim buttons")
 async def job_add(interaction: discord.Interaction):
@@ -629,6 +771,7 @@ async def job_post(
     log_ch = await get_log_channel(interaction.guild)
     if log_ch:
         await log_ch.send(f"🆕 Job #{job_id} created by {interaction.user.mention}: **{title}** ({badge})")
+    await update_job_board()
 
 @bot.tree.command(description="List recent jobs (optionally by status)")
 async def job_list(interaction: discord.Interaction, status: Optional[str] = None):
@@ -667,6 +810,7 @@ async def job_close(interaction: discord.Interaction, job_id: int):
     log_ch = await get_log_channel(interaction.guild)
     if log_ch:
         await log_ch.send(f"🔒 Job #{job_id} closed by {interaction.user.mention}.")
+    await update_job_board()
 
 @bot.tree.command(description="Re-open a closed job")
 @app_commands.describe(job_id="Numeric ID from /job_list")
@@ -687,6 +831,7 @@ async def job_open(interaction: discord.Interaction, job_id: int):
     log_ch = await get_log_channel(interaction.guild)
     if log_ch:
         await log_ch.send(f"🔓 Job #{job_id} reopened by {interaction.user.mention}.")
+    await update_job_board()
 
 @bot.tree.command(description="Delete a job")
 @app_commands.describe(job_id="Numeric ID from /job_list", reason="Optional reason")
@@ -735,6 +880,54 @@ async def job_delete(interaction: discord.Interaction, job_id: int, reason: Opti
         details_str = ", ".join(details)
         rsn = f" Reason: {reason}" if reason else ""
         await log_ch.send(f"🗑️ Job `#{job_id}` (**{title}**) deleted by {interaction.user.mention}. {details_str}.{rsn}{flag}")
+    await update_job_board()
+
+# Slash claim/unclaim by ID (so users can manage from the board)
+@bot.tree.command(description="Claim a job by ID")
+async def job_claim(interaction: discord.Interaction, job_id: int):
+    async with bot.db.execute("SELECT status, claimed_by, open_to_all FROM jobs WHERE id=? AND guild_id=?", (job_id, interaction.guild.id)) as cur:
+        row = await cur.fetchone()
+    if not row:
+        return await interaction.response.send_message("Job not found.", ephemeral=True)
+    status, claimed_by, open_to_all = row
+    if status == "closed":
+        return await interaction.response.send_message("Job is closed.", ephemeral=True)
+    if claimed_by:
+        return await interaction.response.send_message("Already claimed.", ephemeral=True)
+    if not open_to_all and not await has_min_role(interaction):
+        return await interaction.response.send_message("You don't have permission to claim this job.", ephemeral=True)
+
+    await bot.db.execute("UPDATE jobs SET claimed_by=?, status='claimed' WHERE id=?", (interaction.user.id, job_id))
+    await bot.db.commit()
+    await interaction.response.send_message(f"✅ You claimed job #{job_id}.", ephemeral=True)
+    log_ch = await get_log_channel(interaction.guild)
+    if log_ch:
+        await log_ch.send(f"📝 Job #{job_id} claimed by {interaction.user.mention}.")
+    await update_job_board()
+
+@bot.tree.command(description="Unclaim a job by ID")
+async def job_unclaim(interaction: discord.Interaction, job_id: int):
+    async with bot.db.execute("SELECT status, claimed_by FROM jobs WHERE id=? AND guild_id=?", (job_id, interaction.guild.id)) as cur:
+        row = await cur.fetchone()
+    if not row:
+        return await interaction.response.send_message("Job not found.", ephemeral=True)
+    status, claimed_by = row
+    if status == "closed":
+        return await interaction.response.send_message("Job is closed.", ephemeral=True)
+    if not claimed_by:
+        return await interaction.response.send_message("Job is not claimed.", ephemeral=True)
+    is_owner = int(claimed_by) == interaction.user.id
+    is_manager = interaction.user.guild_permissions.manage_messages
+    if not (is_owner or is_manager):
+        return await interaction.response.send_message("Only the claimer or a moderator can unclaim.", ephemeral=True)
+
+    await bot.db.execute("UPDATE jobs SET claimed_by=NULL, status='open' WHERE id=?", (job_id,))
+    await bot.db.commit()
+    await interaction.response.send_message(f"↩️ You unclaimed job #{job_id}.", ephemeral=True)
+    log_ch = await get_log_channel(interaction.guild)
+    if log_ch:
+        await log_ch.send(f"📤 Job #{job_id} unclaimed by {interaction.user.mention}.")
+    await update_job_board()
 
 # ---------------------- warnings ----------------------
 warns = app_commands.Group(name="warn", description="Manage warnings")
