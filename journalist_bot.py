@@ -261,6 +261,16 @@ async def on_connect():
 async def on_ready():
     print(f"[bot] Logged in as {bot.user} (ID: {bot.user.id})")
 
+    # Force per-guild sync after caches are ready
+    try:
+        for g in bot.guilds:
+            bot.tree.copy_global_to(guild=g)
+            await bot.tree.sync(guild=g)
+            print(f"[sync] Commands copied+synced to guild {g.id} ({g.name})")
+    except Exception as e:
+        print("[sync] on_ready per-guild sync error:", e)
+
+
 # ---------------------- helpers ----------------------
 async def normalize(s: str) -> str:
     return " ".join(s.lower().strip().split())
